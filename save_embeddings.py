@@ -126,7 +126,6 @@ def create_collection(vector_size: int):
         print(f"Collection '{COLLECTION_NAME}' already exists. Skipping creation.")
         return
 
-    # Create collection only if it does NOT exist
     qdrant_client.create_collection(
         collection_name=COLLECTION_NAME,
         vectors_config=models.VectorParams(
@@ -150,8 +149,8 @@ def upload_to_qdrant(df: pd.DataFrame, vectors, batch_size: int = 250):
 
         points = []
         for row, vec in zip(batch_df.to_dict(orient="records"), batch_vecs):
-            point_id = int(row["listing_id"])  # or str(row["listing_id"])
-            payload = row  # full row as payload
+            point_id = int(row["listing_id"]) 
+            payload = row  
             points.append(
                 models.PointStruct(
                     id=point_id,
