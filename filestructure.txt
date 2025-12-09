@@ -1,0 +1,17 @@
+|-- .env
+|-- .gitignore
+|-- .ipynb_checkpoints
+    |-- Untitled-checkpoint.ipynb
+|-- .progress.json
+|-- cleaning.py
+|-- processed_data
+|-- raw_data
+    |-- columns info.docx
+    |-- Listings.csv
+    |-- ~$lumns info.docx
+|-- save_embeddings.py
+|-- semantic_search.py
+|-- tempCodeRunnerFile.python
+|-- Untitled.ipynb
+|-- __pycache__
+    |-- save_embeddings.cpython-312.pyc

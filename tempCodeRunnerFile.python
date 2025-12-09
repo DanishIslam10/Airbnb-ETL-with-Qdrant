@@ -1,0 +1,202 @@
+import os
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+import pandas as pd
+
+from google import genai
+from qdrant_client import QdrantClient, models
+
+load_dotenv()
+
+# ---------- Postgres config ----------
+USER = os.getenv("USER")
+PASSWORD = os.getenv("PASSWORD")
+HOST = os.getenv("HOST", "localhost")
+PORT = os.getenv("PORT", "5432")
+DBNAME = os.getenv("DBNAME")
+
+PG_URL = f"postgresql+psycopg2://{USER}:{PASSWORD}@{HOST}:{PORT}/{DBNAME}"
+
+# ---------- Gemini config ----------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Recommended embedding model (text-embedding-004 or gemini-embedding-001) :contentReference[oaicite:2]{index=2}
+EMBED_MODEL = "text-embedding-004"
+
+# ---------- Qdrant config ----------
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
+
+qdrant_client = QdrantClient(
+    url=QDRANT_URL,
+    api_key=QDRANT_API_KEY,   # None for local, token for cloud
+)
+
+COLLECTION_NAME = "airbnb_listings_embeddings"
+
+
+# 1) Load cleaned data from Postgres
+def load_clean_from_postgres() -> pd.DataFrame:
+    engine = create_engine(PG_URL)
+    query = "SELECT * FROM airbnb_listings_clean"
+    df = pd.read_sql(query, engine)
+    print("Loaded from Postgres:", df.shape)
+    return df
+
+
+# 2) Build the text we want to embed
+def build_embedding_text(df: pd.DataFrame) -> pd.DataFrame:
+    # If any of these columns are missing in your table, just remove them from the f-string.
+    # We assume your transform() already created 'text_reviews'.
+    if "text_reviews" not in df.columns:
+        raise ValueError("Expected column 'text_reviews' not found in dataframe!")
+
+    # Some numeric columns -> string to avoid NaN issues
+    for col in ["accommodates", "bedrooms", "price"]:
+        if col in df.columns:
+            df[col] = df[col].fillna(0).astype(int).astype(str)
+
+    # Optional: amenities might be a list-like / string column
+    has_amenities = "amenities" in df.columns
+
+    def row_to_text(row):
+        parts = [
+            f"Listing name: {row.get('name', '')}",
+            f"District: {row.get('district', 'unknown')}",
+            f"City: {row.get('city', 'unknown')}",
+            f"Property type: {row.get('property_type', '')}",
+            f"Room type: {row.get('room_type', '')}",
+            f"Accommodates: {row.get('accommodates', '')} guests",
+            f"Bedrooms: {row.get('bedrooms', '')}",
+        ]
+        if has_amenities:
+            parts.append(f"Amenities: {row.get('amenities', '')}")
+        parts.append(f"Reviews: {row.get('text_reviews', '')}")
+        return " | ".join(parts)
+
+    df["embedding_text"] = df.apply(row_to_text, axis=1)
+    print("Sample embedding_text:\n", df["embedding_text"].head())
+    return df
+
+
+# 3) Gemini embeddings in batches
+def embed_batch(texts):
+    """
+    texts: list[str]
+    returns: list[list[float]]
+    """
+    # google-genai: embed_content with model + contents (list of texts) :contentReference[oaicite:3]{index=3}
+    result = gemini_client.models.embed_content(
+        model=EMBED_MODEL,
+        contents=texts,
+    )
+    return [emb.values for emb in result.embeddings]
+
+
+def embed_all(df: pd.DataFrame, text_col: str = "embedding_text", batch_size: int = 128):
+    vectors = []
+    n = len(df)
+
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        batch_texts = df[text_col].iloc[start:end].tolist()
+        batch_vecs = embed_batch(batch_texts)
+        vectors.extend(batch_vecs)
+        print(f"Embedded rows {start}–{end} / {n}")
+
+    return vectors
+
+
+# 4) Create / recreate Qdrant collection
+def create_collection_if_needed(vector_size: int):
+    # recreate_collection will drop and create anew
+    qdrant_client.recreate_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=models.VectorParams(
+            size=vector_size,
+            distance=models.Distance.COSINE,
+        ),
+    )
+    print(f"Collection '{COLLECTION_NAME}' recreated with vector size={vector_size}.")
+
+
+# 5) Upload points to Qdrant in batches
+def upload_to_qdrant(df: pd.DataFrame, vectors, batch_size: int = 500):
+    if "listing_id" not in df.columns:
+        raise ValueError("Expected primary key column 'listing_id' not found in dataframe!")
+
+    dim = len(vectors[0])
+    create_collection_if_needed(dim)
+
+    n = len(df)
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        batch_df = df.iloc[start:end]
+        batch_vecs = vectors[start:end]
+
+        points = []
+        for row, vec in zip(batch_df.to_dict(orient="records"), batch_vecs):
+            point_id = int(row["listing_id"])  # or str(row["listing_id"])
+            payload = row  # full row as payload
+            points.append(
+                models.PointStruct(
+                    id=point_id,
+                    vector=vec,
+                    payload=payload,
+                )
+            )
+
+        qdrant_client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=points,
+        )
+        print(f"Upserted points {start}–{end} / {n} into Qdrant.")
+
+
+# 6) Semantic search helper
+def semantic_search(query: str, top_k: int = 5):
+    query_vec = embed_batch([query])[0]
+
+    # query_points API for similarity search :contentReference[oaicite:4]{index=4}
+    results = qdrant_client.query_points(
+        collection_name=COLLECTION_NAME,
+        query=query_vec,
+        limit=top_k,
+        with_payload=True,
+        with_vectors=False,
+    )
+
+    print(f"\nTop {top_k} hits for: '{query}'")
+    for i, point in enumerate(results.points, start=1):
+        payload = point.payload
+        print(f"\nRank {i} | id={point.id} | score={point.score}")
+        print("Name:", payload.get("name"))
+        print("City:", payload.get("city"), "| District:", payload.get("district"))
+        print("Property type:", payload.get("property_type"), "| Room type:", payload.get("room_type"))
+        print("Price:", payload.get("price"))
+        print("Sample text:", (payload.get("embedding_text") or "")[:200], "...")
+        print("-" * 60)
+
+
+def main():
+    # 1) load from Postgres
+    df = load_clean_from_postgres()
+
+    # 2) build embedding text
+    df = build_embedding_text(df)
+
+    # 3) embed with Gemini
+    vectors = embed_all(df, text_col="embedding_text", batch_size=128)
+    print("Got embeddings for", len(vectors), "rows.")
+
+    # 4) upload to Qdrant
+    upload_to_qdrant(df, vectors, batch_size=500)
+
+    # 5) quick test queries
+    semantic_search("quiet budget room near city center")
+    semantic_search("luxury apartment with high cleanliness and great location")
+
+
+if __name__ == "__main__":
+    main()
