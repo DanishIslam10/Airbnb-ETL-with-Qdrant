@@ -9,6 +9,7 @@
     |-- columns info.docx
     |-- Listings.csv
     |-- ~$lumns info.docx
+|-- README.md
 |-- save_embeddings.py
 |-- semantic_search.py
 |-- tempCodeRunnerFile.python
